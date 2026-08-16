@@ -21,8 +21,19 @@ data class ScanReport(
     val generatedAt: String,
     val rootScanned: String,
     val filesScanned: Int,
-    val findings: List<Finding>
+    val findings: List<Finding>,
+    val mods: List<ModInfo> = emptyList()
 )
+
+data class ModInfo(
+    val fileName: String,
+    val path: String,
+    val name: String,
+    val version: String,
+    val loader: String   // "fabric" | "forge" | "quilt" | "unknown"
+)
+
+data class DirEntry(val name: String, val fullPath: String, val isDir: Boolean)
 
 /**
  * Runs scan commands through Shizuku's elevated (shell-level) process so the
@@ -81,6 +92,28 @@ object Scanner {
         val out = BufferedReader(InputStreamReader(process.inputStream)).readText()
         process.waitFor()
         return out
+    }
+
+    /**
+     * Lists immediate children of a directory via Shizuku's shell access, so the
+     * user can browse and pick their exact PojavLauncher/.minecraft path instead
+     * of relying on a fixed list of known install locations.
+     */
+    fun listDir(path: String): List<DirEntry> {
+        val safePath = path.ifBlank { "/storage/emulated/0" }
+        val cmd = "find \"$safePath\" -mindepth 1 -maxdepth 1 2>/dev/null | while IFS= read -r f; do " +
+                "if [ -d \"\$f\" ]; then echo \"D:\$f\"; else echo \"F:\$f\"; fi; done"
+        val raw = runShell(cmd)
+        return raw.lineSequence()
+            .filter { it.isNotBlank() }
+            .mapNotNull { line ->
+                val isDir = line.startsWith("D:")
+                val fullPath = line.removePrefix("D:").removePrefix("F:")
+                if (fullPath.isBlank()) return@mapNotNull null
+                DirEntry(name = fullPath.substringAfterLast('/'), fullPath = fullPath, isDir = isDir)
+            }
+            .sortedWith(compareBy({ !it.isDir }, { it.name.lowercase() }))
+            .toList()
     }
 
     fun findPojavRoot(): String? {
@@ -159,12 +192,113 @@ object Scanner {
     }
 
     /**
+     * Reads the mod-loader metadata file (fabric.mod.json / quilt.mod.json / mods.toml /
+     * mcmod.info) out of a jar to get a human-readable mod name + version for display,
+     * separate from the cheat-detection heuristics.
+     */
+    fun readModInfo(localFile: java.io.File, fileName: String, remotePath: String): ModInfo {
+        try {
+            ZipFile(localFile).use { zip ->
+                zip.getEntry("fabric.mod.json")?.let { entry ->
+                    val text = zip.getInputStream(entry).bufferedReader().readText()
+                    val json = JSONObject(text)
+                    return ModInfo(
+                        fileName = fileName,
+                        path = remotePath,
+                        name = json.optString("name", json.optString("id", fileName)),
+                        version = json.optString("version", "unknown"),
+                        loader = "fabric"
+                    )
+                }
+                zip.getEntry("quilt.mod.json")?.let { entry ->
+                    val text = zip.getInputStream(entry).bufferedReader().readText()
+                    val json = JSONObject(text)
+                    val loaderObj = json.optJSONObject("quilt_loader")
+                    return ModInfo(
+                        fileName = fileName,
+                        path = remotePath,
+                        name = loaderObj?.optString("name", loaderObj.optString("id", fileName)) ?: fileName,
+                        version = loaderObj?.optString("version", "unknown") ?: "unknown",
+                        loader = "quilt"
+                    )
+                }
+                (zip.getEntry("META-INF/mods.toml") ?: zip.getEntry("META-INF/neoforge.mods.toml"))?.let { entry ->
+                    val text = zip.getInputStream(entry).bufferedReader().readText()
+                    val name = Regex("displayName\\s*=\\s*\"([^\"]*)\"").find(text)?.groupValues?.get(1)
+                    val version = Regex("version\\s*=\\s*\"([^\"]*)\"").find(text)?.groupValues?.get(1)
+                    return ModInfo(
+                        fileName = fileName,
+                        path = remotePath,
+                        name = name ?: fileName,
+                        version = version ?: "unknown",
+                        loader = "forge"
+                    )
+                }
+                zip.getEntry("mcmod.info")?.let { entry ->
+                    val text = zip.getInputStream(entry).bufferedReader().readText()
+                    val arr = JSONArray(text)
+                    if (arr.length() > 0) {
+                        val obj = arr.getJSONObject(0)
+                        return ModInfo(
+                            fileName = fileName,
+                            path = remotePath,
+                            name = obj.optString("name", fileName),
+                            version = obj.optString("version", "unknown"),
+                            loader = "forge"
+                        )
+                    }
+                }
+            }
+        } catch (e: Exception) {
+            // Fall through to unknown below - unreadable metadata never crashes the scan.
+        }
+        return ModInfo(fileName = fileName, path = remotePath, name = fileName, version = "unknown", loader = "unknown")
+    }
+
+    /**
+     * Scans the text content of every entry inside a jar/zip (class files, resource
+     * files, configs) for known cheat/client identifier strings - catches hits that
+     * a filename-only or metadata-only check would miss.
+     */
+    fun scanArchiveContentForCheatStrings(localFile: java.io.File): List<Pair<String, String>> {
+        val hits = mutableListOf<Pair<String, String>>()
+        val seenTerms = mutableSetOf<String>()
+        try {
+            ZipFile(localFile).use { zip ->
+                for (entry in zip.entries()) {
+                    if (entry.isDirectory) continue
+                    if (entry.size > 5_000_000) continue // skip huge entries (e.g. embedded assets)
+                    val bytes = try {
+                        zip.getInputStream(entry).readBytes()
+                    } catch (e: Exception) {
+                        continue
+                    }
+                    // Read as latin1 so every byte maps to a char - cheap way to find
+                    // ASCII strings embedded in compiled .class files too.
+                    val text = String(bytes, Charsets.ISO_8859_1).lowercase()
+                    for ((term, label) in ClientSignatures.STRONG_NAME_TERMS) {
+                        if (term in seenTerms) continue
+                        if (text.contains(term)) {
+                            seenTerms.add(term)
+                            hits.add(term to label)
+                        }
+                    }
+                }
+            }
+        } catch (e: Exception) {
+            // Not a valid/readable zip - skip silently, same handling as inspectArchive.
+        }
+        return hits
+    }
+
+    /**
      * Full scan pass. Returns a ScanReport, same shape/intent as the PC tool's
      * portal_network_ss_baseline.json, just serialized for the mobile UI.
      */
     fun runScan(root: String, tmpDir: java.io.File, onProgress: (String) -> Unit = {}): ScanReport {
         val files = listFiles(root)
         val findings = mutableListOf<Finding>()
+        val mods = mutableListOf<ModInfo>()
         var scanned = 0
 
         for (path in files) {
@@ -185,15 +319,25 @@ object Scanner {
                 )
             }
 
-            // 2) Archive/jar structural inspection for known mod-loader metadata
+            // 2) Archive/jar structural inspection for known mod-loader metadata,
+            //    mod name/version extraction, and in-content cheat string scanning.
             if (name.endsWith(".jar") || name.endsWith(".zip")) {
                 val tmpFile = java.io.File(tmpDir, "scan_tmp_${scanned}.jar")
                 if (pullToLocal(path, tmpFile)) {
+                    if (name.endsWith(".jar") && path.contains("/mods/")) {
+                        mods.add(readModInfo(tmpFile, name, path))
+                    }
+
                     val archiveHits = inspectArchive(tmpFile)
-                    if (archiveHits.isNotEmpty()) {
+                    val contentHits = scanArchiveContentForCheatStrings(tmpFile)
+                    val allHits = archiveHits + contentHits.map { (term, label) ->
+                        "CHEAT_STRING_IN_CONTENT" to "Cheat/client identifier found inside file contents ($term): $label"
+                    }
+                    if (allHits.isNotEmpty()) {
                         val hash = sha256Remote(path)
-                        for ((kind, label) in archiveHits) {
-                            findings.add(Finding(path, kind, label, "strong", hash))
+                        for ((kind, label) in allHits) {
+                            val confidence = if (kind == "CHEAT_STRING_IN_CONTENT") "weak" else "strong"
+                            findings.add(Finding(path, kind, label, confidence, hash))
                         }
                     }
                     tmpFile.delete()
@@ -205,7 +349,8 @@ object Scanner {
             generatedAt = java.text.SimpleDateFormat("yyyy-MM-dd HH:mm:ss").format(java.util.Date()),
             rootScanned = root,
             filesScanned = scanned,
-            findings = findings
+            findings = findings,
+            mods = mods
         )
     }
 
