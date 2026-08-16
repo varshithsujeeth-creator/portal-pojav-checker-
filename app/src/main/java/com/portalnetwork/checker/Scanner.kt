@@ -370,6 +370,8 @@ object Scanner {
             sourceProject = verifiedProject
         ) to findings
     }
+
+    fun suspiciousNameIndicators(fileName: String): List<Pair<String, String>> {
         val lowered = fileName.lowercase()
         val hits = mutableListOf<Pair<String, String>>()
         for ((term, label) in ClientSignatures.STRONG_NAME_TERMS) {
