@@ -4,6 +4,7 @@ import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
@@ -69,6 +70,8 @@ fun PortalCheckerScreen(
     var status by remember { mutableStateOf("Idle") }
     var report by remember { mutableStateOf<ScanReport?>(null) }
     var scanning by remember { mutableStateOf(false) }
+    var showBrowser by remember { mutableStateOf(false) }
+    var selectedRoot by remember { mutableStateOf<String?>(null) }
     val scope = rememberCoroutineScope()
 
     MaterialTheme(
@@ -116,43 +119,92 @@ fun PortalCheckerScreen(
                             }
                         }
                     }
+                    Spacer(Modifier.height(16.dp))
                 }
 
-                Spacer(Modifier.height(16.dp))
-
-                Button(
-                    enabled = shizukuGranted && !scanning,
-                    onClick = {
-                        scanning = true
-                        status = "Locating PojavLauncher..."
-                        scope.launch {
-                            val root = withContext(Dispatchers.IO) { Scanner.findPojavRoot() }
-                            if (root == null) {
-                                status = "PojavLauncher .minecraft folder not found in known locations."
-                                scanning = false
-                                return@launch
-                            }
-                            status = "Scanning $root ..."
-                            val result = withContext(Dispatchers.IO) {
-                                Scanner.runScan(root, cacheDir) { progress ->
-                                    status = progress
+                if (shizukuGranted) {
+                    // --- Folder selection card ---
+                    Card(
+                        colors = CardDefaults.cardColors(containerColor = BgCard),
+                        shape = RoundedCornerShape(10.dp),
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Column(Modifier.padding(16.dp)) {
+                            Text("Minecraft folder", color = TextPrimary, fontWeight = FontWeight.Bold, fontSize = 14.sp)
+                            Spacer(Modifier.height(6.dp))
+                            Text(
+                                selectedRoot ?: "No folder selected yet.",
+                                color = if (selectedRoot != null) StatusOk else TextMuted,
+                                fontSize = 12.sp
+                            )
+                            Spacer(Modifier.height(10.dp))
+                            Row {
+                                Button(onClick = { showBrowser = true }) {
+                                    Text(if (selectedRoot == null) "Browse & Select Folder" else "Change Folder")
+                                }
+                                Spacer(Modifier.width(8.dp))
+                                OutlinedButton(onClick = {
+                                    scope.launch {
+                                        status = "Searching known PojavLauncher locations..."
+                                        val root = withContext(Dispatchers.IO) { Scanner.findPojavRoot() }
+                                        if (root != null) {
+                                            selectedRoot = root
+                                            status = "Found: $root"
+                                        } else {
+                                            status = "Not found in known locations - use Browse instead."
+                                        }
+                                    }
+                                }) {
+                                    Text("Auto-detect")
                                 }
                             }
-                            report = result
-                            status = "Scan complete: ${result.filesScanned} files, ${result.findings.size} findings."
-                            scanning = false
                         }
                     }
-                ) {
-                    Text(if (scanning) "Scanning..." else "Run Scan")
-                }
 
-                Spacer(Modifier.height(12.dp))
-                Text(status, color = TextMuted, fontSize = 12.sp)
+                    Spacer(Modifier.height(16.dp))
+
+                    Button(
+                        enabled = selectedRoot != null && !scanning,
+                        onClick = {
+                            val root = selectedRoot ?: return@Button
+                            scanning = true
+                            status = "Scanning $root ..."
+                            scope.launch {
+                                val result = withContext(Dispatchers.IO) {
+                                    Scanner.runScan(root, cacheDir) { progress ->
+                                        status = progress
+                                    }
+                                }
+                                report = result
+                                status = "Scan complete: ${result.filesScanned} files, ${result.mods.size} mods, ${result.findings.size} findings."
+                                scanning = false
+                            }
+                        }
+                    ) {
+                        Text(if (scanning) "Scanning..." else "Run Scan")
+                    }
+
+                    Spacer(Modifier.height(12.dp))
+                    Text(status, color = TextMuted, fontSize = 12.sp)
+                }
 
                 Spacer(Modifier.height(16.dp))
 
                 report?.let { r ->
+                    if (r.mods.isNotEmpty()) {
+                        Text(
+                            "Mods installed (${r.mods.size})",
+                            color = TextPrimary,
+                            fontWeight = FontWeight.Bold,
+                            fontSize = 16.sp
+                        )
+                        Spacer(Modifier.height(8.dp))
+                        Column {
+                            r.mods.forEach { mod -> ModRow(mod) }
+                        }
+                        Spacer(Modifier.height(16.dp))
+                    }
+
                     Text(
                         "Findings (${r.findings.size})",
                         color = TextPrimary,
@@ -160,12 +212,137 @@ fun PortalCheckerScreen(
                         fontSize = 16.sp
                     )
                     Spacer(Modifier.height(8.dp))
-                    LazyColumn {
+                    LazyColumn(modifier = Modifier.weight(1f, fill = false)) {
                         items(r.findings) { finding ->
                             FindingRow(finding)
                             Spacer(Modifier.height(8.dp))
                         }
                     }
+                }
+            }
+        }
+
+        if (showBrowser) {
+            FolderBrowserDialog(
+                onDismiss = { showBrowser = false },
+                onFolderSelected = { path ->
+                    selectedRoot = path
+                    showBrowser = false
+                }
+            )
+        }
+    }
+}
+
+@Composable
+fun FolderBrowserDialog(
+    onDismiss: () -> Unit,
+    onFolderSelected: (String) -> Unit
+) {
+    var currentPath by remember { mutableStateOf("/storage/emulated/0") }
+    var entries by remember { mutableStateOf<List<DirEntry>>(emptyList()) }
+    var loading by remember { mutableStateOf(true) }
+
+    LaunchedEffect(currentPath) {
+        loading = true
+        entries = withContext(Dispatchers.IO) { Scanner.listDir(currentPath) }
+        loading = false
+    }
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        containerColor = BgPanel,
+        title = {
+            Column {
+                Text("Select Folder", color = TextPrimary, fontWeight = FontWeight.Bold)
+                Spacer(Modifier.height(4.dp))
+                Text(currentPath, color = AccentCyan, fontSize = 11.sp)
+            }
+        },
+        text = {
+            Column(modifier = Modifier.height(400.dp)) {
+                if (currentPath != "/") {
+                    Text(
+                        ".. (up one level)",
+                        color = TextMuted,
+                        fontSize = 13.sp,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clickable {
+                                currentPath = currentPath.substringBeforeLast('/', "/").ifBlank { "/" }
+                            }
+                            .padding(vertical = 8.dp)
+                    )
+                }
+                if (loading) {
+                    Text("Loading...", color = TextMuted, fontSize = 12.sp, modifier = Modifier.padding(vertical = 8.dp))
+                } else {
+                    LazyColumn(modifier = Modifier.weight(1f)) {
+                        items(entries.filter { it.isDir }) { entry ->
+                            Text(
+                                "\uD83D\uDCC1 ${entry.name}",
+                                color = TextPrimary,
+                                fontSize = 13.sp,
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .clickable { currentPath = entry.fullPath }
+                                    .padding(vertical = 8.dp)
+                            )
+                        }
+                    }
+                }
+            }
+        },
+        confirmButton = {
+            Button(onClick = { onFolderSelected(currentPath) }) {
+                Text("Select This Folder")
+            }
+        },
+        dismissButton = {
+            OutlinedButton(onClick = onDismiss) {
+                Text("Cancel")
+            }
+        }
+    )
+}
+
+@Composable
+fun ModRow(mod: ModInfo) {
+    val (verdictColor, verdictLabel) = when (mod.verdict) {
+        "VERIFIED" -> StatusOk to "VERIFIED"
+        "SUSPICIOUS" -> StatusBad to "SUSPICIOUS"
+        "OBFUSCATED" -> StatusWarn to "OBFUSCATED"
+        else -> TextMuted to "UNKNOWN"
+    }
+    Card(
+        colors = CardDefaults.cardColors(containerColor = BgCard),
+        shape = RoundedCornerShape(8.dp),
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(vertical = 4.dp)
+    ) {
+        Column(Modifier.padding(12.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Column(Modifier.weight(1f)) {
+                    Text(mod.name, color = TextPrimary, fontSize = 13.sp, fontWeight = FontWeight.Bold)
+                    Text("v${mod.version} · ${mod.loader}", color = TextMuted, fontSize = 11.sp)
+                }
+                Box(
+                    modifier = Modifier
+                        .background(verdictColor.copy(alpha = 0.15f), shape = RoundedCornerShape(6.dp))
+                        .padding(horizontal = 8.dp, vertical = 4.dp)
+                ) {
+                    Text(verdictLabel, color = verdictColor, fontSize = 10.sp, fontWeight = FontWeight.Bold)
+                }
+            }
+            if (mod.sourceProject != null) {
+                Spacer(Modifier.height(4.dp))
+                Text("Matched Modrinth project: ${mod.sourceProject}", color = StatusOk, fontSize = 11.sp)
+            }
+            if (mod.verdictReasons.isNotEmpty()) {
+                Spacer(Modifier.height(4.dp))
+                mod.verdictReasons.forEach { reason ->
+                    Text("• $reason", color = TextMuted, fontSize = 11.sp)
                 }
             }
         }

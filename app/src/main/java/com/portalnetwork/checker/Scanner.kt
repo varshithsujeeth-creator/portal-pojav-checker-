@@ -30,7 +30,10 @@ data class ModInfo(
     val path: String,
     val name: String,
     val version: String,
-    val loader: String   // "fabric" | "forge" | "quilt" | "unknown"
+    val loader: String,       // "fabric" | "forge" | "quilt" | "unknown"
+    val verdict: String = "UNKNOWN",   // VERIFIED | UNKNOWN | SUSPICIOUS | OBFUSCATED | BYPASS
+    val verdictReasons: List<String> = emptyList(),
+    val sourceProject: String? = null  // Modrinth project name, if matched
 )
 
 data class DirEntry(val name: String, val fullPath: String, val isDir: Boolean)
@@ -139,6 +142,13 @@ object Scanner {
         return if (hash?.length == 64) hash else null
     }
 
+    private fun sha1Remote(path: String): String? {
+        // Modrinth's version-lookup API keys off SHA1 by default.
+        val out = runShell("sha1sum \"$path\" 2>/dev/null")
+        val hash = out.trim().split(" ").firstOrNull()
+        return if (hash?.length == 40) hash else null
+    }
+
     /** Pull small files (jar/zip metadata reads) into a local temp copy for inspection. */
     private fun pullToLocal(remotePath: String, localFile: java.io.File): Boolean {
         return try {
@@ -162,7 +172,204 @@ object Scanner {
         }
     }
 
-    fun suspiciousNameIndicators(fileName: String): List<Pair<String, String>> {
+    /**
+     * Looks up a mod's SHA1 hash against Modrinth's public version-file API to see
+     * if it's a known, published mod. Returns the project name if matched, or null
+     * if not found / offline / request failed. Never throws - a failed lookup just
+     * means the mod falls back to UNKNOWN rather than VERIFIED.
+     */
+    private fun verifyOnModrinth(sha1: String): String? {
+        return try {
+            val url = java.net.URL("https://api.modrinth.com/v2/version_file/$sha1")
+            val conn = url.openConnection() as java.net.HttpURLConnection
+            conn.requestMethod = "GET"
+            conn.connectTimeout = 6000
+            conn.readTimeout = 6000
+            conn.setRequestProperty("User-Agent", "PortalChecker/1.0")
+            if (conn.responseCode != 200) {
+                conn.disconnect()
+                return null
+            }
+            val body = conn.inputStream.bufferedReader().readText()
+            conn.disconnect()
+            val json = JSONObject(body)
+            // The version endpoint nests project id under "project_id"; we just
+            // surface that id as the "known project" label since resolving it to
+            // a display name would need a second API call.
+            val name = json.optString("name", "")
+            if (name.isNotBlank()) name else json.optString("project_id", "").ifBlank { null }
+        } catch (e: Exception) {
+            null
+        }
+    }
+
+    /**
+     * Detects fullwidth Unicode strings (e.g. "Ａｕｔｏ Ｃｒｙｓｔａｌ") sometimes used to
+     * hide cheat-feature labels from plain-text searches, and maps them back to
+     * their normal-width ASCII meaning so the finding is still readable.
+     */
+    private fun findFullwidthUnicodeCheatStrings(text: String): List<Pair<String, String>> {
+        val hits = mutableListOf<Pair<String, String>>()
+        val fullwidthPattern = Regex("[\uFF01-\uFF5E]{4,}")
+        for (match in fullwidthPattern.findAll(text)) {
+            val normalized = match.value.map { ch ->
+                if (ch.code in 0xFF01..0xFF5E) (ch.code - 0xFEE0).toChar() else ch
+            }.joinToString("").lowercase()
+            for ((term, label) in ClientSignatures.STRONG_NAME_TERMS) {
+                if (normalized.contains(term)) {
+                    hits.add(term to "Fullwidth-Unicode-hidden cheat label decodes to: $label")
+                }
+            }
+        }
+        return hits
+    }
+
+    /**
+     * Heuristic obfuscation analysis based on class-name statistics inside a jar -
+     * mirrors the approach used by public mod-analyzer tooling: legitimate mods
+     * rarely have a high percentage of single/two-letter or numeric class names.
+     */
+    private fun analyzeObfuscation(localFile: java.io.File): List<String> {
+        val reasons = mutableListOf<String>()
+        try {
+            ZipFile(localFile).use { zip ->
+                val classEntries = zip.entries().toList().filter { it.name.endsWith(".class") }
+                if (classEntries.size < 5) return emptyList() // too small a sample to judge
+
+                var shortNameCount = 0
+                var numericNameCount = 0
+                var unicodeNameCount = 0
+                var knownObfuscatorHit: String? = null
+
+                for (entry in classEntries) {
+                    val simpleName = entry.name.substringAfterLast('/').removeSuffix(".class")
+                    if (simpleName.length <= 2) shortNameCount++
+                    if (simpleName.isNotEmpty() && simpleName.all { it.isDigit() }) numericNameCount++
+                    if (simpleName.any { it.code > 127 }) unicodeNameCount++
+
+                    for (marker in ClientSignatures.KNOWN_OBFUSCATOR_MARKERS) {
+                        if (entry.name.lowercase().contains(marker)) knownObfuscatorHit = marker
+                    }
+                }
+
+                val total = classEntries.size
+                val shortPct = shortNameCount * 100 / total
+                val numericPct = numericNameCount * 100 / total
+
+                if (shortPct > 40) reasons.add("$shortPct% of classes have 1-2 letter names (typical of automated obfuscation)")
+                if (numericPct > 20) reasons.add("$numericPct% of classes have purely numeric names")
+                if (unicodeNameCount > 0) reasons.add("$unicodeNameCount class name(s) contain non-ASCII characters")
+                knownObfuscatorHit?.let { reasons.add("Matches known obfuscator signature: $it") }
+
+                for (marker in ClientSignatures.KNOWN_CHEAT_MARKERS) {
+                    if (classEntries.any { it.name.lowercase().contains(marker.lowercase()) }) {
+                        reasons.add("Contains known cheat-client marker: $marker")
+                    }
+                }
+            }
+        } catch (e: Exception) {
+            // Unreadable jar - skip silently, same as every other archive-inspection path.
+        }
+        return reasons
+    }
+
+    /**
+     * Extracts and scans jars nested inside META-INF/jars/ (a common Fabric pattern
+     * for bundling shaded dependencies) so hidden cheat code can't hide one layer deep.
+     */
+    private fun scanNestedJars(localFile: java.io.File, tmpDir: java.io.File): List<Pair<String, String>> {
+        val hits = mutableListOf<Pair<String, String>>()
+        try {
+            ZipFile(localFile).use { zip ->
+                val nested = zip.entries().toList().filter {
+                    it.name.startsWith("META-INF/jars/") && it.name.endsWith(".jar")
+                }
+                for (entry in nested) {
+                    val nestedFile = java.io.File(tmpDir, "nested_${entry.name.substringAfterLast('/')}")
+                    try {
+                        zip.getInputStream(entry).use { input ->
+                            nestedFile.outputStream().use { output -> input.copyTo(output) }
+                        }
+                        val contentHits = scanArchiveContentForCheatStrings(nestedFile)
+                        for ((term, label) in contentHits) {
+                            hits.add(term to "Found inside nested jar ${entry.name.substringAfterLast('/')}: $label")
+                        }
+                    } finally {
+                        nestedFile.delete()
+                    }
+                }
+            }
+        } catch (e: Exception) {
+            // Skip silently.
+        }
+        return hits
+    }
+
+    /**
+     * Full classification pass for one mod file - runs hash verification, content
+     * scanning, obfuscation analysis, fullwidth Unicode detection, and nested-jar
+     * scanning, then rolls it all up into a single verdict.
+     */
+    fun classifyMod(localFile: java.io.File, fileName: String, remotePath: String, tmpDir: java.io.File): Pair<ModInfo, List<Finding>> {
+        val baseInfo = readModInfo(localFile, fileName, remotePath)
+        val findings = mutableListOf<Finding>()
+        val reasons = mutableListOf<String>()
+
+        // Phase 1: hash verification against Modrinth
+        val sha1 = sha1Remote(remotePath)
+        val verifiedProject = sha1?.let { verifyOnModrinth(it) }
+
+        // Phase 2: content + fullwidth-unicode string scanning
+        val contentHits = scanArchiveContentForCheatStrings(localFile)
+        val unicodeHits = try {
+            ZipFile(localFile).use { zip ->
+                val all = mutableListOf<Pair<String, String>>()
+                for (entry in zip.entries()) {
+                    if (entry.isDirectory || entry.size > 3_000_000) continue
+                    val bytes = try { zip.getInputStream(entry).readBytes() } catch (e: Exception) { continue }
+                    all += findFullwidthUnicodeCheatStrings(String(bytes, Charsets.UTF_8))
+                }
+                all
+            }
+        } catch (e: Exception) { emptyList() }
+
+        // Phase 3: nested jar scanning
+        val nestedHits = scanNestedJars(localFile, tmpDir)
+
+        // Phase 4: obfuscation analysis
+        val obfuscationReasons = analyzeObfuscation(localFile)
+
+        val hash = sha256Remote(remotePath)
+        for ((term, label) in contentHits) {
+            findings.add(Finding(remotePath, "CHEAT_STRING_IN_CONTENT", "Cheat/client identifier found inside file contents ($term): $label", "weak", hash))
+        }
+        for ((term, label) in unicodeHits) {
+            findings.add(Finding(remotePath, "HIDDEN_UNICODE_CHEAT_LABEL", label, "strong", hash))
+            reasons.add(label)
+        }
+        for ((term, label) in nestedHits) {
+            findings.add(Finding(remotePath, "NESTED_JAR_CHEAT_STRING", label, "weak", hash))
+        }
+        for (r in obfuscationReasons) {
+            findings.add(Finding(remotePath, "OBFUSCATION_INDICATOR", r, "weak", hash))
+            reasons.add(r)
+        }
+
+        val verdict = when {
+            unicodeHits.isNotEmpty() || nestedHits.isNotEmpty() -> "SUSPICIOUS"
+            contentHits.size >= 2 -> "SUSPICIOUS"
+            verifiedProject != null -> "VERIFIED"
+            obfuscationReasons.isNotEmpty() -> "OBFUSCATED"
+            contentHits.isNotEmpty() -> "SUSPICIOUS"
+            else -> "UNKNOWN"
+        }
+
+        return baseInfo.copy(
+            verdict = verdict,
+            verdictReasons = reasons,
+            sourceProject = verifiedProject
+        ) to findings
+    }
         val lowered = fileName.lowercase()
         val hits = mutableListOf<Pair<String, String>>()
         for ((term, label) in ClientSignatures.STRONG_NAME_TERMS) {
@@ -320,24 +527,22 @@ object Scanner {
             }
 
             // 2) Archive/jar structural inspection for known mod-loader metadata,
-            //    mod name/version extraction, and in-content cheat string scanning.
+            //    mod name/version extraction, hash verification, obfuscation
+            //    analysis, and in-content cheat string scanning.
             if (name.endsWith(".jar") || name.endsWith(".zip")) {
                 val tmpFile = java.io.File(tmpDir, "scan_tmp_${scanned}.jar")
                 if (pullToLocal(path, tmpFile)) {
                     if (name.endsWith(".jar") && path.contains("/mods/")) {
-                        mods.add(readModInfo(tmpFile, name, path))
-                    }
-
-                    val archiveHits = inspectArchive(tmpFile)
-                    val contentHits = scanArchiveContentForCheatStrings(tmpFile)
-                    val allHits = archiveHits + contentHits.map { (term, label) ->
-                        "CHEAT_STRING_IN_CONTENT" to "Cheat/client identifier found inside file contents ($term): $label"
-                    }
-                    if (allHits.isNotEmpty()) {
-                        val hash = sha256Remote(path)
-                        for ((kind, label) in allHits) {
-                            val confidence = if (kind == "CHEAT_STRING_IN_CONTENT") "weak" else "strong"
-                            findings.add(Finding(path, kind, label, confidence, hash))
+                        val (modInfo, modFindings) = classifyMod(tmpFile, name, path, tmpDir)
+                        mods.add(modInfo)
+                        findings.addAll(modFindings)
+                    } else {
+                        val archiveHits = inspectArchive(tmpFile)
+                        if (archiveHits.isNotEmpty()) {
+                            val hash = sha256Remote(path)
+                            for ((kind, label) in archiveHits) {
+                                findings.add(Finding(path, kind, label, "strong", hash))
+                            }
                         }
                     }
                     tmpFile.delete()

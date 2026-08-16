@@ -186,6 +186,27 @@ object ClientSignatures {
         "\\windows\\system32\\"
     )
 
+    // Known bytecode obfuscators used to hide cheat-client code (from public
+    // mod-analysis tooling). A match here doesn't prove a mod is a cheat, but
+    // it's a strong signal worth surfacing since legitimate mods rarely ship obfuscated.
+    val KNOWN_OBFUSCATOR_MARKERS: Set<String> = setOf(
+        "skidfuscator", "paramorphism", "radon", "caesium", "bozar",
+        "branchlock", "binscure", "superblaubeere27", "qprotect",
+        "zelix", "stringer", "jnic", "scuti", "smoke"
+    )
+
+    // Package/class/file markers seen in known cheat-client mod bundles.
+    val KNOWN_CHEAT_MARKERS: Set<String> = setOf(
+        "org/chainlibs/module/impl/modules",
+        "phantom-refmap.json",
+        "client-refmap.json",
+        "cheat-refmap.json",
+        "jnativehook",
+        "imgui.binding",
+        "imgui.gl3",
+        "imgui.glfw"
+    )
+
     val REPORT_FILE_NAME = "portal_network_ss_baseline.json"
     val AI_CACHE_FILE = ".portal_network_ss"
 }
