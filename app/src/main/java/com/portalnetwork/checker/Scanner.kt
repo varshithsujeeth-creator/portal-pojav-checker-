@@ -60,8 +60,24 @@ object Scanner {
         }
     }
 
+    /**
+     * Shizuku.newProcess() is marked private in the API artifact even though the
+     * method still exists at runtime, so it's invoked via reflection here. This is
+     * the standard workaround used by apps built against modern Shizuku API versions.
+     */
+    private fun shizukuNewProcess(cmd: Array<String>, env: Array<String>?, dir: String?): Process {
+        val method = Shizuku::class.java.getDeclaredMethod(
+            "newProcess",
+            Array<String>::class.java,
+            Array<String>::class.java,
+            String::class.java
+        )
+        method.isAccessible = true
+        return method.invoke(null, cmd, env, dir) as Process
+    }
+
     private fun runShell(cmd: String): String {
-        val process = Shizuku.newProcess(arrayOf("sh", "-c", cmd), null, null)
+        val process = shizukuNewProcess(arrayOf("sh", "-c", cmd), null, null)
         val out = BufferedReader(InputStreamReader(process.inputStream)).readText()
         process.waitFor()
         return out
@@ -104,7 +120,7 @@ object Scanner {
 
     private fun runShellBinary(remotePath: String): ByteArray? {
         return try {
-            val process = Shizuku.newProcess(arrayOf("sh", "-c", "cat \"$remotePath\""), null, null)
+            val process = shizukuNewProcess(arrayOf("sh", "-c", "cat \"$remotePath\""), null, null)
             val bytes = process.inputStream.readBytes()
             process.waitFor()
             bytes
